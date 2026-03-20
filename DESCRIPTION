@@ -1,0 +1,30 @@
+Package: acr
+Title: Adversarial Causal Regularization Without Predefined Environments
+Version: 0.1.0
+Authors@R: c(
+    person("Francisco", "Richter", role = c("aut", "cre"),
+           email = "richtf@usi.ch"),
+    person(given = c("Ernst", "C."), family = "Wit", role = "aut",
+           email = "ernst.jan.camiel.wit@usi.ch"))
+Description: Implements adversarial causal regularization (ACR) for learning
+    predictors that are robust to distribution shift, without requiring
+    predefined environment labels. Supports linear regression, generalized
+    linear models (Poisson, binomial), and generalized additive models (via
+    mgcv). The two-phase algorithm learns soft environment weights
+    adversarially (Phase 1) and selects regularization strength via
+    cross-validation (Phase 2).
+License: GPL-3
+Encoding: UTF-8
+RoxygenNote: 7.3.3
+Depends: R (>= 4.1.0)
+Imports:
+    stats,
+    graphics,
+    utils,
+    mgcv
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+Config/testthat/edition: 3
+VignetteBuilder: knitr
