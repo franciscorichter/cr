@@ -1,13 +1,23 @@
 # Phase 1: Adversarial weight learning (Algorithm 1)
-# Model-agnostic: operates via backend interface
+# Model-agnostic: operates via backend interface.
+#
+# Canonical (non-alternating) form: the pooled reference predictor is fit ONCE
+# (backend$init_loss gives its per-observation losses); these FIXED losses are
+# used for every step. Phase 1 only moves the weights -- the predictor is never
+# re-solved inside the loop. The learner is re-estimated only afterwards by
+# Phase 2 (.cv_gamma_fit) for the discovered weights.
 
 .learn_weights <- function(backend, gamma_learn, control) {
   eps <- control$eps
 
-  # Step 1: Initialize weights from initial losses (Eq. 10)
+  # Step 1: FIXED reference losses from the pooled fit, computed ONCE (Eq. 10).
+  # These are the squared residuals of the ridge-OLS pooled predictor and do
+  # NOT change across Phase-1 steps.
   init_loss <- backend$init_loss()
+  loss_vec <- init_loss
+
+  # Step 2: Initialize weights from the (signed) reference losses (Eq. 10).
   w <- .init_weights(init_loss)
-  fitted <- backend$fit(w, gamma_learn)
   momentum_buf <- rep(0, length(w))
 
   # Pre-allocate history
@@ -20,13 +30,11 @@
   )
 
   for (step in seq_len(n_steps)) {
-    # Step 2: Per-observation losses from current model
-    loss_vec <- backend$loss(fitted)
-
-    # Step 3: Weighted risks and gradients (Eq. 15-17)
+    # Step 3: Weighted risks and gradients on the FIXED reference losses
+    # (Eq. 15-17). No per-step model re-fit.
     terms <- .weighted_risks_and_grads(loss_vec, w, eps)
 
-    # Step 4: Sign determination (Eq. 16)
+    # Step 4: Sign of the contrast (Eq. 16)
     sign_diff <- ifelse(terms$risk1 >= terms$risk2, 1.0, -1.0)
 
     # Step 5: Balance penalty (Eq. 19)
@@ -35,25 +43,27 @@
     # Step 6: Entropy (Eq. 20)
     ent <- .entropy_and_grad(w, eps)
 
-    # Objective for diagnostics
-    objective <- (1 + gamma_learn * sign_diff) * terms$risk1 +
-                 (1 - gamma_learn * sign_diff) * terms$risk2 -
+    # Pure risk contrast |R1 - R2| -- the objective Phase 1 ascends, minus the
+    # balance and entropy regularizers.
+    objective <- abs(terms$risk1 - terms$risk2) -
                  control$kappa * pen$penalty -
                  control$entropy_coeff * ent$entropy
 
-    # Step 7: Adversary gradient (Eq. 21)
-    adv_grad <- (1 + gamma_learn * sign_diff) * terms$grad1 +
-                (1 - gamma_learn * sign_diff) * terms$grad2
-    total_grad <- adv_grad - control$kappa * pen$grad -
+    # Step 7: Pure-contrast ascent gradient.
+    #   d|R1 - R2|/dw = s * (dR1/dw - dR2/dw),  s = sign(R1 - R2).
+    # .weighted_risks_and_grads returns grad1 = dR1/dw and
+    # grad2 = -dR2_raw/d(1-w) (chain-ruled). The canonical contrast_grad in
+    # experiments/acr_core.R computes s*(r1$grad + r2$grad) where r2$grad is the
+    # raw d/d(1-w); since our grad2 negates that raw term, the equivalent here is
+    # s*(grad1 - grad2).
+    contrast_grad <- sign_diff * (terms$grad1 - terms$grad2)
+    total_grad <- contrast_grad - control$kappa * pen$grad -
                   control$entropy_coeff * ent$grad
 
     # Step 8: Momentum update and projection (Eq. 22)
     momentum_buf <- control$momentum * momentum_buf +
                     (1 - control$momentum) * total_grad
     w <- pmin(pmax(w + control$lr * momentum_buf, eps), 1 - eps)
-
-    # Step 9: Re-fit model with updated weights
-    fitted <- backend$fit(w, gamma_learn * sign_diff)
 
     # Record diagnostics
     hist$risk1[step] <- terms$risk1
@@ -70,5 +80,5 @@
     }
   }
 
-  list(fitted = fitted, weights = w, history = hist)
+  list(weights = w, history = hist)
 }

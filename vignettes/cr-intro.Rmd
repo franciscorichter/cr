@@ -1,0 +1,302 @@
+---
+title: "Causal Regularization with and without Known Environments"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Causal Regularization with and without Known Environments}
+  %\VignetteEngine{knitr::knitr}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 6.5,
+  fig.height = 4,
+  fig.align = "center"
+)
+set.seed(1)
+have_ggplot <- requireNamespace("ggplot2", quietly = TRUE)
+```
+
+## 1. Overview
+
+Standard regression chooses the predictor that minimises average loss on the
+data it sees. When the training data pools together several *environments*
+(experimental batches, sites, time periods, sub-populations), that strategy can
+latch onto associations that hold *on average* but are not stable across
+environments — typically associations with **descendants of the response**
+(spurious children) whose coupling to the outcome shifts from one environment to
+another. A predictor that leans on such a feature looks great in-sample and
+fails under distribution shift.
+
+**Causal regularization** corrects for this by penalising predictors whose risk
+is *unstable* across environments, steering the fit toward the stable (causal)
+features. The `cr` package implements this idea in two modes that share the same
+machinery and differ only in how the environments are obtained:
+
+- **`cr(..., env = <labels>)` — Causal Regularization (CR), environments known.**
+  You supply a two-level environment label and the method fixes the soft
+  environment weights directly from it.
+- **`cr(..., env = NULL)` / `acr(...)` — Adversarial Causal Regularization (ACR),
+  environments unknown.** No labels are needed. The method *discovers* a
+  worst-case split of the data into two pseudo-environments (Phase 1) and then
+  regularizes against it.
+
+In both modes a cross-validation step (Phase 2) selects the regularization
+strength and solves the final estimator once.
+
+```{r load}
+library(cr)
+```
+
+## 2. A worked example: a spurious child
+
+We simulate a small linear structural model. The response `Y` is *caused* by two
+parents `X1` and `X2`. We then add a **spurious child** `X3` that is generated
+*from* `Y` (so `X3` is a descendant, not a cause), and whose noise level changes
+between two latent environments. Because `X3` tracks `Y` very tightly in
+environment 0 and loosely in environment 1, its usefulness as a predictor is
+*unstable* — exactly the kind of feature causal regularization should down-weight.
+
+```{r sim}
+set.seed(3)
+n   <- 800
+grp <- rep(c(0, 1), each = n / 2)        # latent environment (held out from ACR)
+
+X1 <- rnorm(n)
+X2 <- rnorm(n)
+Y  <- 1.0 * X1 + 1.0 * X2 + rnorm(n, 0, 0.7)   # truth: X1 = X2 = 1, X3 = 0
+
+# spurious child of Y, with environment-dependent noise -> unstable coupling
+sd_env <- ifelse(grp == 0, 0.2, 1.5)
+X3 <- Y + rnorm(n, 0, sd_env)
+
+dat  <- data.frame(X1, X2, X3, Y)
+envf <- factor(grp, labels = c("env0", "env1"))
+```
+
+Ordinary least squares cannot tell a parent from a child; it simply uses
+whatever lowers the pooled loss. Here it over-weights the spurious child `X3`
+and, as a consequence, *under-estimates* the true parents `X1` and `X2`:
+
+```{r ols}
+ols <- lm(Y ~ X1 + X2 + X3, data = dat)
+round(coef(ols), 3)
+```
+
+The truth is `X1 = 1`, `X2 = 1`, `X3 = 0`, yet OLS puts a sizeable coefficient
+on `X3` and pulls the parents below 1.
+
+## 3. Phase 1, explained clearly
+
+Phase 1 is the heart of the *unknown-environment* (ACR) mode. Its job is to
+**discover** a split of the data into two pseudo-environments that makes the
+predictor look as unstable as possible — without ever being told the true
+environment labels. It works as follows.
+
+**Step 1 — fit a pooled predictor once.** We fit an ordinary (ridge) least-squares
+predictor on *all* the data and record its per-observation losses
+$\ell_i = r_i^2$ (squared residuals). This pooled fit is computed **once** and
+then held **fixed** for the rest of Phase 1.
+
+**Step 2 — initialise soft weights from the signed residuals.** Each observation
+gets a soft weight $w_i \in (0,1)$ that says how much it belongs to
+pseudo-environment 1 (versus environment 2, which gets weight $1 - w_i$). We
+seed these weights from the *signed* residuals of the pooled fit,
+
+$$
+\tilde\ell_i = \frac{r_i - \mathrm{median}(r)}{\mathrm{sd}(r) + \varepsilon},
+\qquad
+w_i = 0.1 + 0.8\,\sigma(\tilde\ell_i),
+$$
+
+with $\sigma$ the logistic function. Points the pooled model *over-predicts* and
+points it *under-predicts* are nudged toward opposite pseudo-environments — a
+natural starting guess for an unstable split.
+
+**Step 3 — sharpen the split by gradient ascent on the risk contrast.** Define the
+(normalised) weighted risks of the two pseudo-environments using the **fixed**
+pooled losses,
+
+$$
+R_1(w) = \frac{\sum_i w_i\,\ell_i}{\sum_i w_i},
+\qquad
+R_2(w) = \frac{\sum_i (1 - w_i)\,\ell_i}{\sum_i (1 - w_i)}.
+$$
+
+Phase 1 then moves the weights by gradient **ascent** to make the two risks as
+*different* as possible — it maximises the **risk contrast** $|R_1(w) - R_2(w)|$.
+The ascent gradient is $s\,\bigl(\nabla R_1 - \nabla R_2^{(\text{chain})}\bigr)$
+with $s = \mathrm{sign}(R_1 - R_2)$. Two regularizers keep the split sensible:
+
+- a **balance penalty** $\kappa\,(\overline{w} - \rho)^2$ that keeps the mean
+  weight near $\rho = 0.5$, so neither pseudo-environment collapses to a handful
+  of points; and
+- an **entropy** term that discourages the weights from saturating at exactly
+  $0$ or $1$ too early.
+
+> **Why does a high-contrast split expose causal instability?**
+> A feature that is genuinely causal lowers the loss *the same way everywhere*,
+> so no split of the data can make its associated risk swing much. A spurious,
+> anti-causal feature, by contrast, helps a lot in some parts of the data and
+> hurts in others. The split that *maximises* the risk gap therefore lines up
+> with the dimension along which the predictor is unstable — which is precisely
+> the spurious structure we want to regularize away. By searching for the
+> worst-case split, ACR manufactures the "environments" that a labelled method
+> would have been handed for free.
+
+**No alternating re-fit.** This is the key structural point: Phase 1 **only moves
+the weights**. The pooled predictor and its losses are computed once and never
+re-solved inside the loop. (The predictor is re-estimated only afterwards, in
+Phase 2, for the discovered weights.) This non-alternating form matches the
+validated reference implementation and makes Phase 1 a clean, well-posed
+maximisation over $w$.
+
+Let us run ACR on the data and keep the Phase-1 diagnostics for plotting:
+
+```{r fit-acr}
+set.seed(3)
+fit_acr <- acr(Y ~ X1 + X2 + X3, data = dat,
+               control = cr_control(n_steps = 400))
+round(coef(fit_acr), 3)
+```
+
+ACR shrinks the spurious child `X3` toward zero and pushes the parents back up
+toward their true value of 1.
+
+## 4. Phase 2, briefly
+
+With the soft weights `w` in hand (discovered in ACR mode, or fixed from the
+labels in CR mode), Phase 2:
+
+1. builds the two **weighted moment matrices** for the pseudo-environments and
+   their sum $G_+$ and difference $G_\Delta$ (likewise for the cross-moment
+   vectors $Z_+, Z_\Delta$);
+2. forms the regularized normal equations
+   $(G_+ + \Gamma\, s\, G_\Delta + \lambda I)\,\beta = Z_+ + \Gamma\, s\, Z_\Delta$,
+   where $s = \mathrm{sign}(R_1 - R_2)$ aligns the penalty with the heavier
+   environment and the ridge $\lambda$ keeps the system PSD / well-conditioned;
+3. selects the regularization strength $\Gamma$ by **K-fold cross-validation** on
+   a worst-case risk criterion $(R_1 + R_2) + \Gamma\,|R_1 - R_2|$; and
+4. **solves the estimator once** at the selected $\Gamma$.
+
+```{r gamma}
+fit_acr$gamma_fit   # selected regularization strength
+```
+
+## 5. Plots
+
+```{r ggplot-theme, eval = have_ggplot}
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+```
+
+### Plot A — Phase-1 convergence
+
+The Phase-1 history records the two pseudo-environment risks at every step. As
+the split sharpens, $R_1$ and $R_2$ pull apart and the contrast $|R_1 - R_2|$
+grows.
+
+```{r plotA, eval = have_ggplot}
+h <- fit_acr$history
+conv <- data.frame(
+  iteration = rep(seq_along(h$risk1), 3),
+  value     = c(h$risk1, h$risk2, abs(h$risk1 - h$risk2)),
+  series    = factor(rep(c("R1", "R2", "|R1 - R2|"),
+                         each = length(h$risk1)),
+                     levels = c("R1", "R2", "|R1 - R2|"))
+)
+
+ggplot(conv, aes(iteration, value, colour = series)) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = c("R1" = "#1b9e77",
+                                 "R2" = "#d95f02",
+                                 "|R1 - R2|" = "#7570b3")) +
+  labs(title = "Phase 1: the split sharpens over iterations",
+       x = "Iteration", y = "Pseudo-environment risk",
+       colour = NULL) +
+  theme(legend.position = "top")
+```
+
+### Plot B — discovered weights vs. the true environment
+
+Phase 1 never sees `grp`. If it has recovered the latent split, the learned
+weights should separate by the *true* (held-out) environment label.
+
+```{r plotB, eval = have_ggplot}
+wdf <- data.frame(weight = fit_acr$weights, environment = envf)
+
+ggplot(wdf, aes(environment, weight, colour = environment)) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.35, size = 1) +
+  geom_boxplot(width = 0.4, outlier.shape = NA, alpha = 0,
+               colour = "grey20") +
+  scale_colour_manual(values = c("env0" = "#1b9e77", "env1" = "#d95f02")) +
+  labs(title = "Discovered soft weights group by the true environment",
+       x = "True (held-out) environment", y = "Learned weight w") +
+  theme(legend.position = "none")
+```
+
+### Plot C — coefficient recovery
+
+Finally we compare the estimated coefficients of OLS, ACR (unknown env), CR
+(known env), and the truth. The spurious child `X3` should be shrunk toward zero
+and the parents `X1`, `X2` recovered toward 1.
+
+```{r fit-cr}
+fit_cr <- cr(Y ~ X1 + X2 + X3, data = dat, env = envf)
+round(coef(fit_cr), 3)
+```
+
+```{r plotC, eval = have_ggplot}
+truth <- c(`(Intercept)` = 0, X1 = 1, X2 = 1, X3 = 0)
+terms <- c("X1", "X2", "X3")
+
+coef_df <- rbind(
+  data.frame(term = terms, value = coef(ols)[terms],     method = "OLS"),
+  data.frame(term = terms, value = coef(fit_acr)[terms], method = "ACR (env unknown)"),
+  data.frame(term = terms, value = coef(fit_cr)[terms],  method = "CR (env known)"),
+  data.frame(term = terms, value = truth[terms],         method = "Truth")
+)
+coef_df$method <- factor(coef_df$method,
+                         levels = c("Truth", "OLS", "ACR (env unknown)", "CR (env known)"))
+
+ggplot(coef_df, aes(term, value, fill = method)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  scale_fill_manual(values = c("Truth" = "grey30",
+                               "OLS" = "#d95f02",
+                               "ACR (env unknown)" = "#1b9e77",
+                               "CR (env known)" = "#7570b3")) +
+  labs(title = "Coefficient recovery: the spurious child X3 is shrunk",
+       x = NULL, y = "Estimated coefficient", fill = NULL) +
+  theme(legend.position = "top")
+```
+
+The two causal-regularization fits keep the parents `X1`, `X2` near 1 and pull
+the spurious child `X3` toward 0, while OLS over-weights `X3`.
+
+## 6. Known vs. unknown environments
+
+The same data illustrates the two modes side by side:
+
+```{r compare}
+tab <- rbind(
+  Truth = c(X1 = 1, X2 = 1, X3 = 0),
+  OLS   = coef(ols)[c("X1", "X2", "X3")],
+  ACR   = coef(fit_acr)[c("X1", "X2", "X3")],
+  CR    = coef(fit_cr)[c("X1", "X2", "X3")]
+)
+round(tab, 3)
+```
+
+- **`acr(...)` (env unknown)** has to *discover* the worst-case split in Phase 1
+  before it can regularize. It works from the data alone and recovers most of
+  the structure.
+- **`cr(..., env = envf)` (env known)** skips Phase 1 entirely and fixes the
+  weights from the labels. With the true split handed to it, it regularizes
+  against exactly the right instability and typically suppresses the spurious
+  child most strongly.
+
+Both share Phase 2 unchanged. In practice you use `cr(env = ...)` when reliable
+environment labels exist, and `acr(...)` when they do not.
