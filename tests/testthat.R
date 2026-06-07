@@ -1,4 +1,4 @@
 library(testthat)
-library(acr)
+library(cr)
 
-test_check("acr")
+test_check("cr")

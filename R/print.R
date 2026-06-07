@@ -1,9 +1,16 @@
 #' @export
-print.acr <- function(x, ...) {
-  cat("Adversarial Causal Regularization\n\n")
+print.cr <- function(x, ...) {
+  cat("Causal Regularization\n\n")
   cat("Call:\n  ", deparse(x$call), "\n\n")
+  if (identical(x$mode, "acr")) {
+    cat("Mode: adversarial (ACR)\n")
+  } else {
+    cat("Mode: known environments (CR)\n")
+  }
   cat("Backend:", x$backend_type, "\n")
-  cat("Gamma (learn):", x$gamma_learn, "\n")
+  if (identical(x$mode, "acr")) {
+    cat("Gamma (learn):", x$gamma_learn, "\n")
+  }
   cat("Gamma (fit, CV-selected):", x$gamma_fit, "\n\n")
   cat("Coefficients:\n")
   print(round(x$coefficients, 4))
@@ -13,12 +20,21 @@ print.acr <- function(x, ...) {
 }
 
 #' @export
-summary.acr <- function(object, ...) {
-  cat("Adversarial Causal Regularization\n\n")
+summary.cr <- function(object, ...) {
+  cat("Causal Regularization\n\n")
   cat("Call:\n  ", deparse(object$call), "\n\n")
+  if (identical(object$mode, "acr")) {
+    cat("Mode: adversarial (ACR)\n")
+  } else {
+    cat("Mode: known environments (CR)\n")
+  }
   cat("Backend:", object$backend_type, "\n")
-  cat("Phase 1: gamma_learn =", object$gamma_learn,
-      ",", object$control$n_steps, "steps\n")
+  if (identical(object$mode, "acr")) {
+    cat("Phase 1: gamma_learn =", object$gamma_learn,
+        ",", object$control$n_steps, "steps\n")
+  } else {
+    cat("Phase 1: skipped (environments supplied)\n")
+  }
   cat("Phase 2: gamma_fit =", object$gamma_fit,
       "(selected from", length(object$cv_scores), "candidates)\n\n")
 
@@ -34,18 +50,20 @@ summary.acr <- function(object, ...) {
   cat("\nWeight distribution:\n")
   cat("  Mean:", round(mean(object$weights), 3), "\n")
   cat("  SD:", round(sd(object$weights), 3), "\n")
-  h <- object$history
-  cat("  Final risk gap |R1-R2|:",
-      round(abs(tail(h$risk1, 1) - tail(h$risk2, 1)), 4), "\n")
+  if (identical(object$mode, "acr") && !is.null(object$history)) {
+    h <- object$history
+    cat("  Final risk gap |R1-R2|:",
+        round(abs(tail(h$risk1, 1) - tail(h$risk2, 1)), 4), "\n")
+  }
 
   invisible(object)
 }
 
 #' @export
-coef.acr <- function(object, ...) object$coefficients
+coef.cr <- function(object, ...) object$coefficients
 
 #' @export
-predict.acr <- function(object, newdata, ...) {
+predict.cr <- function(object, newdata, ...) {
   if (object$backend_type == "lm") {
     X_new <- model.matrix(object$call$formula, newdata)
     as.numeric(X_new %*% object$coefficients)
@@ -55,7 +73,11 @@ predict.acr <- function(object, newdata, ...) {
 }
 
 #' @export
-plot.acr <- function(x, ...) {
+plot.cr <- function(x, ...) {
+  if (!identical(x$mode, "acr") || is.null(x$history)) {
+    stop("plot.cr(): adversarial diagnostics are only available in ACR mode ",
+         "(env = NULL).")
+  }
   h <- x$history
   n <- length(h$risk1)
   oldpar <- par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))

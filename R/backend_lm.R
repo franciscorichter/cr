@@ -23,7 +23,9 @@
     Z_delta <- m1$Z - m2$Z
     A <- G_plus + gamma_s * G_delta + ridge * diag(p)
     b <- Z_plus + gamma_s * Z_delta
-    as.numeric(solve(A, b))
+    beta <- as.numeric(solve(A, b))
+    names(beta) <- colnames(X)
+    beta
   }
 
   list(
